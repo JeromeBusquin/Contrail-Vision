@@ -159,8 +159,10 @@ def main():
     output_video_path = 'C:/Users/jerom/Projects/RMS_data/InferenceTest/output_with_tracking.mp4'
     out = cv2.VideoWriter(output_video_path, fourcc, fps, (width, height))
 
+
     # Initialize ByteTrack
     byte_tracker = BYTETracker(Args())
+
 
     frame_index = 0
     # Process each frame and perform tracking
