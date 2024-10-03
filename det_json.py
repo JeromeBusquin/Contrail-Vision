@@ -54,16 +54,13 @@ def infer_image(frame_rgb, api_key, project_name, version_number):
 # Function to process a single frame and get lat-long data
 def process_frame(frame_predictions, platepar, roi_x, roi_y):
     masks = []
-
     # Set the confidence threshold
     confidence_threshold = 0.2
-
     # Filter predictions based on confidence threshold
     predictions = [
         pred for pred in frame_predictions['predictions']
         if pred.get('confidence', 1.0) >= confidence_threshold
     ]
-
     # Iterate over the segmentation data
     for prediction in predictions:
         if 'points' in prediction and prediction['points']:
@@ -72,24 +69,24 @@ def process_frame(frame_predictions, platepar, roi_x, roi_y):
                 [[point['x'], point['y']] for point in prediction['points']],
                 dtype=np.int32
             )
-
             # Check if there are at least 3 points
             if len(points) >= 3:
                 masks.append(points)
             else:
                 print(f"Skipping prediction with insufficient points: {points}")
-    
+
     # Convert masks to lat-long pairs
     lat_lon_data = []
     for mask_points in masks:
-        if len(mask_points) >= 2:  # Ensure there are enough points to form a line
-            start_x, start_y = mask_points[0]
-            end_x, end_y = mask_points[-1]
-            start_lat, start_lon = XyHt2Geo(platepar, start_x + roi_x, start_y + roi_y, 11000)
-            end_lat, end_lon = XyHt2Geo(platepar, end_x + roi_x, end_y + roi_y, 11000)
-            lat_lon_data.append([start_lat, start_lon, end_lat, end_lon])
+        polygon_lat_lon = []
+        for point in mask_points:
+            x, y = point
+            lat, lon = XyHt2Geo(platepar, x + roi_x, y + roi_y, 11000)
+            polygon_lat_lon.append([lat, lon])
+        lat_lon_data.append(polygon_lat_lon)
 
     return lat_lon_data
+
 
 def load_platepar_from_gcs(bucket_name, platepar_blob_name):
     # Initialize GCS client
