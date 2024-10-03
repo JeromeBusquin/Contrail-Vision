@@ -7,6 +7,8 @@ import cv2
 from google.cloud import storage
 from datetime import datetime
 import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import multiprocessing
 
 # Get the current script's directory
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -55,7 +57,7 @@ def infer_image(frame_rgb, api_key, project_name, version_number):
 def process_frame(frame_predictions, platepar, roi_x, roi_y):
     masks = []
     # Set the confidence threshold
-    confidence_threshold = 0.2
+    confidence_threshold = 0.05
     # Filter predictions based on confidence threshold
     predictions = [
         pred for pred in frame_predictions['predictions']
@@ -131,6 +133,51 @@ def save_to_gcs(bucket_name, file_name, data):
 
     print(f"File {file_name} uploaded to {bucket_name}.")
 
+def process_frame_parallel(args):
+    blob, platepar, roi_x, roi_y, api_key, project_name, version_number = args
+    filename = os.path.basename(blob.name)
+    
+    # Extract timestamp (same as before)
+    parts = filename.split('_')
+    if len(parts) < 5:
+        print(f"Unexpected filename format: {filename}")
+        return None
+
+    date_str, time_str = parts[2], parts[3]
+    datetime_str = date_str + time_str
+
+    try:
+        timestamp_dt = datetime.strptime(datetime_str, "%Y%m%d%H%M%S")
+        frame_timestamp = int(timestamp_dt.timestamp())
+    except ValueError as e:
+        print(f"Error parsing date and time from filename {filename}: {e}")
+        return None
+
+    print(f"Processing frame {filename} with timestamp {timestamp_dt}")
+
+    # Download and process image (same as before)
+    image_data = blob.download_as_bytes()
+    image_array = np.frombuffer(image_data, np.uint8)
+    frame = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
+
+    if frame is None:
+        print(f"Failed to read image {filename}")
+        return None
+
+    roi_frame = frame[roi_y:roi_y + frame.shape[0], roi_x:roi_x + frame.shape[1]]
+    frame_rgb = cv2.cvtColor(roi_frame, cv2.COLOR_BGR2RGB)
+
+    # Get predictions and process frame
+    frame_predictions = infer_image(frame_rgb, api_key, project_name, version_number)
+    if frame_predictions is None:
+        print(f"Frame {filename}: Inference failed.")
+        return None
+
+    lat_lon_data = process_frame(frame_predictions, platepar, roi_x, roi_y)
+
+    # Return detections for this frame
+    return [{"c": lat_lon, "t": frame_timestamp} for lat_lon in lat_lon_data]
+
 # Main function to handle frame processing and saving lat-long data
 def main():
     # Set up GCS bucket and API details
@@ -146,7 +193,7 @@ def main():
 
     # Flag to process every n-th frame
     process_every_nth_frame = True
-    n = 120  # Process every 5th frame
+    n = 12
 
     # Initialize GCS client
     storage_client = storage.Client()
@@ -157,84 +204,34 @@ def main():
     # Load the platepar directly from GCS
     platepar = load_platepar_from_gcs(input_bucket_name, platepar_blob_name)
 
-    # List all image blobs in the input bucket
+    # List and filter blobs (same as before)
     blobs = list(storage_client.list_blobs(input_bucket_name, prefix=input_folder_prefix))
-
-    # Filter and sort blobs to ensure correct order
     image_blobs = [
         blob for blob in blobs
         if blob.name.lower().endswith(('.png', '.jpg', '.jpeg'))
     ]
     image_blobs.sort(key=lambda x: x.name)
 
-    # Limit the blobs to every n-th frame if the flag is set
     if process_every_nth_frame:
         image_blobs = image_blobs[::n]
 
-    # Initialize an empty list to store the contrail detections in the desired format
-    contrail_detections = []
+    # Prepare arguments for parallel processing
+    process_args = [
+        (blob, platepar, 0, 0, api_key, project_name, version_number)
+        for blob in image_blobs
+    ]
 
-    # Process each frame
-    for idx, blob in enumerate(image_blobs):
-        # Extract the filename from the blob name
-        filename = os.path.basename(blob.name)
+    # Use ThreadPoolExecutor for I/O-bound operations (network requests)
+    with ThreadPoolExecutor(max_workers=multiprocessing.cpu_count() * 2) as executor:
+        future_to_frame = {executor.submit(process_frame_parallel, args): args for args in process_args}
+        
+        contrail_detections = []
+        for future in as_completed(future_to_frame):
+            result = future.result()
+            if result:
+                contrail_detections.extend(result)
 
-        # Example filename: UC_US9999_20231122_155519_480.jpg
-        # Split the filename to extract date and time
-        parts = filename.split('_')
-        if len(parts) < 5:
-            print(f"Unexpected filename format: {filename}")
-            continue
-
-        date_str = parts[2]  # '20231122'
-        time_str = parts[3]  # '155519'
-
-        datetime_str = date_str + time_str  # '20231122155519'
-
-        try:
-            timestamp_dt = datetime.strptime(datetime_str, "%Y%m%d%H%M%S")
-            frame_timestamp = int(timestamp_dt.timestamp())
-        except ValueError as e:
-            print(f"Error parsing date and time from filename {filename}: {e}")
-            continue
-
-        print(f"Processing frame {filename} with timestamp {timestamp_dt} (Frame {idx+1}/{len(image_blobs)})")
-
-        # Download image data into memory
-        image_data = blob.download_as_bytes()
-        image_array = np.frombuffer(image_data, np.uint8)
-        frame = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
-
-        if frame is None:
-            print(f"Failed to read image {filename}")
-            continue
-
-        # Define ROI parameters (update as needed)
-        roi_x, roi_y, roi_w, roi_h = 0, 0, frame.shape[1], frame.shape[0]
-
-        # Crop frame to ROI if needed
-        roi_frame = frame[roi_y:roi_y + roi_h, roi_x:roi_x + roi_w]
-
-        # Convert frame from BGR to RGB
-        frame_rgb = cv2.cvtColor(roi_frame, cv2.COLOR_BGR2RGB)
-
-        # Get predictions for the current frame
-        frame_predictions = infer_image(frame_rgb, api_key, project_name, version_number)
-        if frame_predictions is None:
-            print(f"Frame {filename}: Inference failed.")
-            continue
-
-        # Process the frame and get lat-long data for masks
-        lat_lon_data = process_frame(frame_predictions, platepar, roi_x, roi_y)
-
-        # Store the detections in the desired format
-        for lat_lon in lat_lon_data:
-            contrail_detections.append({
-                "c": lat_lon,  # Coordinates of the contrail
-                "t": frame_timestamp  # Timestamp in Unix format for this frame
-            })
-
-    # Save the detections as a JSON file to GCS in the desired format
+    # Save the detections as a JSON file to GCS
     json_data = {"d": contrail_detections}
     output_file_name = f"{output_folder_prefix}contrail_detections_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.json"
     save_to_gcs(output_bucket_name, output_file_name, json_data)
