@@ -1,4 +1,5 @@
 import os
+import tempfile
 import sys
 import json
 import numpy as np
@@ -7,7 +8,16 @@ from google.cloud import storage
 from datetime import datetime
 import requests
 
-sys.path.append('/Users/jerom/Projects/RMS-Contrail')
+# Get the current script's directory
+current_dir = os.path.dirname(os.path.abspath(__file__))
+
+# Go up one level
+projects_dir = os.path.abspath(os.path.join(current_dir, '..'))
+
+# Append the RMS-Contrail path
+rms_contrail_path = os.path.join(projects_dir, 'RMS-Contrail')
+sys.path.append(rms_contrail_path)
+
 from RMS.Astrometry.ApplyAstrometry import XyHt2Geo
 from RMS.Formats.Platepar import Platepar
 
@@ -68,7 +78,7 @@ def process_frame(frame_predictions, platepar, roi_x, roi_y):
                 masks.append(points)
             else:
                 print(f"Skipping prediction with insufficient points: {points}")
-
+    
     # Convert masks to lat-long pairs
     lat_lon_data = []
     for mask_points in masks:
@@ -81,25 +91,33 @@ def process_frame(frame_predictions, platepar, roi_x, roi_y):
 
     return lat_lon_data
 
-# Function to read the platepar file from GCS directly and load it into Platepar
 def load_platepar_from_gcs(bucket_name, platepar_blob_name):
     # Initialize GCS client
     storage_client = storage.Client()
-
+    
     # Get the platepar blob from GCS
-    platepar_blob = storage_client.bucket(bucket_name).blob(platepar_blob_name)
-
-    # Download the platepar data as bytes
-    platepar_data = platepar_blob.download_as_bytes()
-
-    # Initialize the Platepar object
-    platepar = Platepar()
-
-    # Read the platepar data from bytes
-    # Assuming Platepar can read from a string or bytes-like object
-    platepar.read(platepar_data)
-
-    return platepar
+    bucket = storage_client.bucket(bucket_name)
+    platepar_blob = bucket.blob(platepar_blob_name)
+    
+    # Download the content directly into memory
+    platepar_content = platepar_blob.download_as_text()
+    
+    # Create a temporary file
+    with tempfile.NamedTemporaryFile(mode='w+', delete=False) as temp_file:
+        temp_file.write(platepar_content)
+        temp_file_path = temp_file.name
+    
+    try:
+        # Initialize the Platepar object
+        platepar = Platepar()
+        
+        # Read the platepar data from the temporary file
+        platepar.read(temp_file_path)
+        
+        return platepar
+    finally:
+        # Clean up the temporary file
+        os.unlink(temp_file_path)
 
 
 # Function to save data to GCS as a JSON file
