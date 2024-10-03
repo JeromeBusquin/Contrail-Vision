@@ -138,7 +138,7 @@ def main():
     input_folder_prefix = "US9999_20231122_155519/"
 
     output_bucket_name = "contrailcast-trial-run-1-hierarchical"
-    output_folder_prefix = "Ground_Detected/"
+    output_folder_prefix = "detected_contrails_ground/"
 
     api_key = '6Kzy0L8WP8idrygkLOUr'  # Replace with your actual API key
     project_name = 'contrails-0lwhn-ibga0'  # Replace with your project name
