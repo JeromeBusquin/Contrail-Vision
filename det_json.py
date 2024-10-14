@@ -5,7 +5,7 @@ import json
 import numpy as np
 import cv2
 from google.cloud import storage
-from datetime import datetime
+from datetime import datetime, timezone
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import multiprocessing
@@ -83,7 +83,7 @@ def process_frame(frame_predictions, platepar, roi_x, roi_y):
         polygon_lat_lon = []
         for point in mask_points:
             x, y = point
-            lat, lon = XyHt2Geo(platepar, x + roi_x, y + roi_y, 11000)
+            lat, lon = XyHt2Geo(platepar, x + roi_x, y + roi_y, 12500)  # 41,000 ft
             polygon_lat_lon.append([lat, lon])
         lat_lon_data.append(polygon_lat_lon)
 
@@ -120,18 +120,31 @@ def load_platepar_from_gcs(bucket_name, platepar_blob_name):
 
 
 # Function to save data to GCS as a JSON file
-def save_to_gcs(bucket_name, file_name, data):
-    # Initialize GCS client
-    storage_client = storage.Client()
+def get_year_doy_hour(timestamp):
+    dt = datetime.utcfromtimestamp(timestamp)
+    return dt.year, dt.timetuple().tm_yday, dt.hour
 
-    # Get the bucket
+def save_to_gcs_organized(bucket_name, folder_prefix, data):
+    storage_client = storage.Client()
     bucket = storage_client.bucket(bucket_name)
 
-    # Create a new blob and upload the data
-    blob = bucket.blob(file_name)
-    blob.upload_from_string(json.dumps(data), content_type='application/json')
+    # Group detections by year, DOY, and hour
+    organized_data = {}
+    for detection in data["d"]:
+        timestamp = detection["t"]
+        year, doy, hour = get_year_doy_hour(timestamp)
+        key = (year, doy, hour)
+        if key not in organized_data:
+            organized_data[key] = {"d": []}
+        organized_data[key]["d"].append(detection)
 
-    print(f"File {file_name} uploaded to {bucket_name}.")
+    # Save each group to a separate file
+    for (year, doy, hour), hourly_data in organized_data.items():
+        file_path = f"{folder_prefix}{year:04d}/{doy:03d}/{hour:02d}/positives_ground.json"
+        blob = bucket.blob(file_path)
+        blob.upload_from_string(json.dumps(hourly_data), content_type='application/json')
+        print(f"File {file_path} uploaded to {bucket_name}.")
+
 
 def process_frame_parallel(args):
     blob, platepar, roi_x, roi_y, api_key, project_name, version_number = args
@@ -147,7 +160,7 @@ def process_frame_parallel(args):
     datetime_str = date_str + time_str
 
     try:
-        timestamp_dt = datetime.strptime(datetime_str, "%Y%m%d%H%M%S")
+        timestamp_dt = datetime.strptime(datetime_str, "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
         frame_timestamp = int(timestamp_dt.timestamp())
     except ValueError as e:
         print(f"Error parsing date and time from filename {filename}: {e}")
@@ -233,8 +246,7 @@ def main():
 
     # Save the detections as a JSON file to GCS
     json_data = {"d": contrail_detections}
-    output_file_name = f"{output_folder_prefix}contrail_detections_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.json"
-    save_to_gcs(output_bucket_name, output_file_name, json_data)
+    save_to_gcs_organized(output_bucket_name, output_folder_prefix, json_data)
 
     print("Processing complete. JSON file with detections saved to GCS.")
 
