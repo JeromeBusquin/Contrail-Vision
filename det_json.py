@@ -85,7 +85,10 @@ def process_frame(frame_predictions, platepar, roi_x, roi_y):
             x, y = point
             lat, lon = XyHt2Geo(platepar, x + roi_x, y + roi_y, 12500)  # 41,000 ft
             polygon_lat_lon.append([lat, lon])
-        lat_lon_data.append(polygon_lat_lon)
+
+        # Close the polygon by adding the first point at the end
+        if polygon_lat_lon and polygon_lat_lon[0] != polygon_lat_lon[-1]:
+            polygon_lat_lon.append(polygon_lat_lon[0])
 
     return lat_lon_data
 
@@ -141,6 +144,7 @@ def save_to_gcs_organized(bucket_name, folder_prefix, data):
     # Save each group to a separate file
     for (year, doy, hour), hourly_data in organized_data.items():
         file_path = f"{folder_prefix}{year:04d}/{doy:03d}/{hour:02d}/positives_ground.json"
+        print(f"file_path: {file_path}")
         blob = bucket.blob(file_path)
         blob.upload_from_string(json.dumps(hourly_data), content_type='application/json')
         print(f"File {file_path} uploaded to {bucket_name}.")
@@ -162,6 +166,8 @@ def process_frame_parallel(args):
     try:
         timestamp_dt = datetime.strptime(datetime_str, "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
         frame_timestamp = int(timestamp_dt.timestamp())
+        print(f"frame_timestamp: {frame_timestamp}, datetime_str: {datetime_str} , timestamp_dt: {timestamp_dt}")
+
     except ValueError as e:
         print(f"Error parsing date and time from filename {filename}: {e}")
         return None
@@ -186,7 +192,11 @@ def process_frame_parallel(args):
         print(f"Frame {filename}: Inference failed.")
         return None
 
+    print(f"Frame {filename}: Inference results: {frame_predictions}")
+
     lat_lon_data = process_frame(frame_predictions, platepar, roi_x, roi_y)
+
+    print(f"Frame {filename}: Processed lat_lon_data: {lat_lon_data}")
 
     # Return detections for this frame
     return [{"c": lat_lon, "t": frame_timestamp} for lat_lon in lat_lon_data]
@@ -206,7 +216,7 @@ def main():
 
     # Flag to process every n-th frame
     process_every_nth_frame = True
-    n = 12
+    n = 120
 
     # Initialize GCS client
     storage_client = storage.Client()
@@ -246,6 +256,7 @@ def main():
 
     # Save the detections as a JSON file to GCS
     json_data = {"d": contrail_detections}
+    print(f"Saving: {output_bucket_name}, {output_folder_prefix}, {json_data}")
     save_to_gcs_organized(output_bucket_name, output_folder_prefix, json_data)
 
     print("Processing complete. JSON file with detections saved to GCS.")
