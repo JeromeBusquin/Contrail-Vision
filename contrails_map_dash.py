@@ -3,17 +3,17 @@ from google.cloud import storage
 import pandas as pd
 import geopandas as gpd
 from datetime import datetime, timedelta, timezone
-import os
 import re
-import numpy as np
 import concurrent.futures
 
 import dash
-from dash import html, dcc, no_update
+from dash import html, dcc
 import dash_leaflet as dl
-import dash_leaflet.express as dlx
 from dash.dependencies import Input, Output, State
 import dash_daq as daq
+
+from shapely.geometry import LineString
+
 
 def list_blobs_with_prefix(bucket_name, prefix):
     storage_client = storage.Client()
@@ -114,12 +114,11 @@ def main():
     contrail_bucket_name = "contrails_external"  # Replace with your contrail bucket name
     contrail_base_path = "tool_v2/detected_contrails_prod"  # Replace with your base path
     adsb_bucket_name = "contrailcast-trial-run-1-hierarchical"  # Replace with your ADSB bucket name
-    min_altitude = 10000  # Set your desired minimum altitude here
+    min_altitude = 23000  # Set your desired minimum altitude here in feet
 
     date_str = input("Enter date (YYYY-MM-DD): ")
     try:
         date = datetime.strptime(date_str, "%Y-%m-%d")
-        year, doy = date.year, date.timetuple().tm_yday
     except ValueError:
         print("Invalid date format. Please use YYYY-MM-DD.")
         return
@@ -144,8 +143,6 @@ def main():
     run_dash_app(contrail_gdf, adsb_gdf)
 
 def prepare_contrail_geodataframe(contrail_data):
-    from shapely.geometry import LineString
-    import geopandas as gpd
 
     data = []
     for point in contrail_data:
@@ -175,19 +172,14 @@ def prepare_adsb_geodataframe(adsb_data):
             'timestamp': entry['timestamp'],
             'end_time': entry['timestamp'] + timedelta(minutes=1),
             'altitude': entry['alt_geom'],
-            'type': entry.get('t', None)
+            'type': entry.get('t', None),
+            'hex': entry.get('hex')
         })
 
     gdf = gpd.GeoDataFrame(data, crs="EPSG:4326")
     return gdf
 
 def run_dash_app(contrail_gdf, adsb_gdf):
-    import dash
-    from dash import html, dcc
-    import dash_leaflet as dl
-    from dash.dependencies import Input, Output, State
-    import dash_daq as daq
-    import pandas as pd
 
     # Remove timezone information from timestamps
     contrail_gdf['timestamp'] = contrail_gdf['timestamp'].dt.tz_localize(None)
@@ -205,13 +197,16 @@ def run_dash_app(contrail_gdf, adsb_gdf):
 
     # Initialize Dash app
     app = dash.Dash(__name__)
-    server = app.server  # For deploying if needed
+
+    # server = app.server  # For deploying if needed
+    contrail_layer = dl.LayerGroup(id='contrail-layer')
+    adsb_layer = dl.LayerGroup(id='adsb-layer')
 
     app.layout = html.Div([
         html.H1("Contrail and ADSB Data Visualization"),
         html.Div([
             daq.BooleanSwitch(id='play-pause', on=False, label='Play/Pause', labelPosition='bottom'),
-            dcc.Interval(id='interval-component', interval=1000, n_intervals=0, disabled=True),
+            dcc.Interval(id='interval-component', interval=100, n_intervals=0, disabled=True),
             html.Div(id='current-time', style={'textAlign': 'center'}),
             dcc.Slider(
                 id='time-slider',
@@ -229,11 +224,11 @@ def run_dash_app(contrail_gdf, adsb_gdf):
             style={'width': '100%', 'height': '80vh'},
             children=[
                 dl.TileLayer(),
-                dl.LayerGroup(id='contrail-layer'),
-                dl.LayerGroup(id='adsb-layer'),
+                contrail_layer,
+                adsb_layer,
                 dl.LayersControl(
-                    [dl.Overlay(dl.LayerGroup(id='contrail-layer'), name="Contrails", checked=True),
-                    dl.Overlay(dl.LayerGroup(id='adsb-layer'), name="ADSB Data", checked=True)]
+                    [dl.Overlay(contrail_layer, name="Contrails", checked=True),
+                    dl.Overlay(adsb_layer, name="ADSB Data", checked=True)]
                 ),
                 dl.FullScreenControl(),
             ]
@@ -289,17 +284,55 @@ def run_dash_app(contrail_gdf, adsb_gdf):
                 (contrail_gdf['end_time'] > selected_time)
             ].copy()
 
-            # Filter ADSB data
+            # Filter ADSB data for the last up to 10 minutes
             adsb_current = adsb_gdf[
                 (adsb_gdf['timestamp'] <= selected_time) &
-                (adsb_gdf['end_time'] > selected_time)
+                (adsb_gdf['timestamp'] >= selected_time - timedelta(minutes=10))
             ].copy()
 
-            print(f"Number of Contrail entries at selected time: {len(contrail_current)}")
-            print(f"Number of ADSB entries at selected time: {len(adsb_current)}")
-            
+            # Prepare trajectory and current position data
+            trajectories = []
+            positions = []
+            if not adsb_current.empty:
+                # Group ADSB data by aircraft identifier
+                adsb_grouped = adsb_current.groupby('hex')
+
+                for hex_code, group in adsb_grouped:
+                    group = group.sort_values('timestamp')
+                    if len(group) >= 2:
+                        # Create trajectory LineString
+                        trajectory = LineString(group.geometry.tolist())
+                        trajectories.append({
+                            'hex': hex_code,
+                            'geometry': trajectory,
+                            'timestamp': selected_time
+                        })
+                    # Get current position (last point)
+                    current_position = group.iloc[-1]
+                    positions.append({
+                        'hex': hex_code,
+                        'geometry': current_position.geometry,
+                        'timestamp': current_position.timestamp,
+                        'altitude': current_position.altitude
+                    })
+
+            # Create GeoDataFrames
+            trajectory_gdf = gpd.GeoDataFrame(
+                trajectories,
+                columns=['hex', 'geometry', 'timestamp'],
+                geometry='geometry',
+                crs="EPSG:4326"
+            )
+
+            positions_gdf = gpd.GeoDataFrame(
+                positions,
+                columns=['hex', 'geometry', 'timestamp', 'altitude'],
+                geometry='geometry',
+                crs="EPSG:4326"
+            )
+
             # Contrail Layer
-            contrail_geojson = None
+            contrail_geojson = []
             if not contrail_current.empty:
                 contrail_current['timestamp'] = contrail_current['timestamp'].astype(str)
                 contrail_current['end_time'] = contrail_current['end_time'].astype(str)
@@ -310,27 +343,46 @@ def run_dash_app(contrail_gdf, adsb_gdf):
                     zoomToBoundsOnClick=True
                 )]
 
-            # ADSB Layer
-            adsb_geojson = None
-            if not adsb_current.empty:
-                adsb_current['timestamp'] = adsb_current['timestamp'].astype(str)
-                adsb_current['end_time'] = adsb_current['end_time'].astype(str)
-                adsb_geojson = [dl.GeoJSON(
-                    data=adsb_current.to_crs(epsg=4326).__geo_interface__,
-                    cluster=True,
-                    zoomToBoundsOnClick=True,
-                    superClusterOptions={"radius": 75},
-                )]
+            # Prepare ADSB Layer Children
+            adsb_layer_children = []
 
+            # Add Trajectories to ADSB Layer
+            if not trajectory_gdf.empty:
+                adsb_trajectory_geojson = dl.GeoJSON(
+                    data=trajectory_gdf.__geo_interface__,
+                    style={'color': 'blue', 'weight': 2, 'opacity': 0.8},
+                    hoverStyle={'color': 'yellow', 'weight': 5, 'opacity': 1},
+                    zoomToBoundsOnClick=True
+                )
+                adsb_layer_children.append(adsb_trajectory_geojson)
 
-            return contrail_geojson, adsb_geojson
+            # Add Altitude Markers to ADSB Layer using DivMarker
+            if not positions_gdf.empty:
+                for idx, row in positions_gdf.iterrows():
+                    lat = row.geometry.y
+                    lon = row.geometry.x
+                    altitude = row.altitude
+
+                    # Create a DivMarker to display the altitude as text
+                    altitude_marker = dl.DivMarker(
+                        position=[lat, lon],
+                        iconOptions={
+                            'html': f'<div style="font-size: 12px; color: blue; text-align: center;">{altitude} ft</div>',
+                            'iconSize': [50, 20],  # Adjust as needed
+                            'iconAnchor': [25, 10],  # Center the icon
+                            'className': ''  # Optional CSS class
+                        }
+                    )
+                    adsb_layer_children.append(altitude_marker)
+
+            return contrail_geojson, adsb_layer_children
 
         except Exception as e:
-            print(f"Exception in update_map: {str(e)}")
+            print(f"Exception in update_layers: {str(e)}")
             import traceback
             traceback.print_exc()
             return [], []
-        
+            
     # Run the Dash app
     app.run_server(debug=True, use_reloader=False)  # Disable reloader to prevent duplicate execution
 
